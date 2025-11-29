@@ -1,0 +1,412 @@
+require "import"
+import "android.widget.*"
+import "android.content.*"
+import "android.os.*"
+import "android.graphics.*"
+import "android.view.*"
+import "android.net.*"
+import "android.app.*" -- Importar para DownloadManager
+import "com.androlua.Http"
+import "org.json.JSONObject"
+
+local context = service
+local activity = context
+-- API para buscar videos de YouTube
+local SEARCH_API = "https://youtubesearch.angelvalentinr15.workers.dev/?q=%s&limit=30"
+-- API actualizada para obtener enlaces de descarga de videos
+local DOWNLOAD_API = "https://api-blindroid.vercel.app/youtube/download?url=%s"
+
+-- NOTA: Utilizando la nueva API de Blindroid (https://api-blindroid.vercel.app/)
+-- Esta API es gratuita pero requiere mostrar cr茅ditos como se especifica en la documentaci贸n.
+-- Cr茅ditos: @blindroidofficial - Made by: @Ismail_memon
+
+local searchResults = {}
+local currentVideo = {}
+local downloadDialog = nil
+local progressDialog = nil
+
+-- Funci贸n para mostrar di谩logos de advertencia/error/informaci贸n
+local function showDialog(title, message)
+    local dlg = AlertDialog.Builder(context)
+    dlg.setTitle(title)
+    dlg.setMessage(message)
+    dlg.setPositiveButton("OK", nil)
+    dlg.show()
+end
+
+-- Funci贸n para mostrar cr茅ditos de la API
+local function showCredits()
+    local creditsMsg = "API Credits:\n\n" ..
+                      "馃摫 API: YouTube Downloader & Transcriber Pro\n" ..
+                      "漏锔� Copy Claims By: @blindroidofficial\n" ..
+                      "馃懆鈥嶐煉� Made by: @Ismail_memon 鈿n" ..
+                      "馃寪 Base URL: https://api-blindroid.vercel.app/"
+    
+    local dlg = AlertDialog.Builder(context)
+    dlg.setTitle("API Credits")
+    dlg.setMessage(creditsMsg)
+    dlg.setPositiveButton("OK", nil)
+    dlg.show()
+end
+
+-- Funci贸n HTTP simplificada sin timeout personalizado
+local function httpGet(url, callback)
+    -- Usar Http.get est谩ndar
+    Http.get(url, nil, "UTF-8", function(code, content)
+        callback(code, content)
+    end)
+end
+
+-- Funci贸n mejorada para parsear JSON de forma segura
+local function safeParseJSON(jsonString)
+    if not jsonString or jsonString == "" then
+        return false, nil, "Respuesta vac铆a"
+    end
+    
+    -- Limpiar la cadena JSON de caracteres no v谩lidos
+    local cleanJson = jsonString:gsub("^%s+", ""):gsub("%s+$", "")
+    
+    local success, result = pcall(function()
+        return JSONObject(cleanJson)
+    end)
+    
+    if success then
+        return true, result, nil
+    else
+        return false, nil, "Error al parsear JSON: " .. tostring(result)
+    end
+end
+
+-- Funci贸n para buscar videos
+local function searchVideos(query)
+    -- Mostrar un di谩logo de progreso mientras se busca
+    progressDialog = ProgressDialog.show(context, "Buscando", "Obteniendo resultados...", true)
+    progressDialog.setCancelable(true)
+
+    -- Codificar la consulta para la URL
+    local url = string.format(SEARCH_API, Uri.encode(query))
+
+    -- Realizar la solicitud HTTP a la API de b煤squeda
+    httpGet(url, function(code, content)
+        if progressDialog then
+            progressDialog.dismiss()
+        end
+
+        -- Verificar si la solicitud fue exitosa (c贸digo 200) y si hay contenido
+        if code ~= 200 or not content then
+            showDialog("Error", "B煤squeda fallida: " .. tostring(code))
+            return
+        end
+
+        -- Intentar parsear el contenido JSON de forma segura
+        local success, json, error = safeParseJSON(content)
+        if not success then
+            showDialog("Error", "Datos de b煤squeda inv谩lidos: " .. (error or "Error desconocido"))
+            return
+        end
+
+        searchResults = {} -- Limpiar resultados anteriores
+        local items = json.optJSONArray("items") -- Obtener el array de elementos (videos)
+
+        -- Verificar si se encontraron resultados
+        if not items or items.length() == 0 then
+            showDialog("Info", "No se encontraron resultados para su b煤squeda.")
+            return
+        end
+
+        -- Iterar sobre los resultados y guardarlos en la tabla searchResults
+        for i = 0, items.length() - 1 do
+            local item = items.getJSONObject(i)
+            local title = item.optString("title", "Sin t铆tulo")
+            local videoId = item.optString("id", "")
+            
+            if videoId ~= "" then
+                table.insert(searchResults, {
+                    title = title,
+                    url = "https://www.youtube.com/watch?v=" .. videoId,
+                    videoId = videoId,
+                    thumbnail = item.optString("thumbnail", ""),
+                    author = { 
+                        name = item.optJSONObject("author") and 
+                               item.optJSONObject("author").optString("name") or "Desconocido" 
+                    },
+                    duration = { 
+                        simpleText = item.optJSONObject("duration") and 
+                                   item.optJSONObject("duration").optString("simpleText") or "N/A" 
+                    }
+                })
+            end
+        end
+
+        if #searchResults == 0 then
+            showDialog("Info", "No se pudieron procesar los resultados de b煤squeda.")
+            return
+        end
+
+        -- Crear un adaptador para la ListView con los t铆tulos de los videos
+        local adapter = ArrayAdapter(context, android.R.layout.simple_list_item_1)
+        for _, v in ipairs(searchResults) do
+            adapter.add(v.title)
+        end
+
+        resultsList.setAdapter(adapter) -- Establecer el adaptador en la ListView
+        statusText.setText(string.format("%d resultados encontrados", #searchResults)) -- Actualizar el texto de estado
+    end)
+end
+
+-- Funci贸n para iniciar la descarga del video
+local function startDownload()
+    if not currentVideo.url then
+        showDialog("Error", "No se ha seleccionado ning煤n video para descargar.")
+        return
+    end
+
+    -- Mostrar un di谩logo de progreso para la descarga de enlaces
+    progressDialog = ProgressDialog.show(context, "Descargando", "Obteniendo enlaces de descarga...", true)
+    progressDialog.setCancelable(true)
+
+    -- Construir la URL para la nueva API de descarga
+    local downloadUrl = string.format(DOWNLOAD_API, currentVideo.url)
+    
+    -- Debug: Mostrar la URL que se est谩 usando
+    print("URL de descarga: " .. downloadUrl)
+
+    -- Realizar la solicitud HTTP a la API de descarga
+    httpGet(downloadUrl, function(code, content)
+        if progressDialog then
+            progressDialog.dismiss()
+        end
+
+        if code ~= 200 or not content then
+            local errorMsg = "Fallo al obtener enlaces de descarga.\n\nC贸digo de error: " .. tostring(code)
+            
+            -- Mensajes espec铆ficos para diferentes c贸digos de error
+            if code == 500 then
+                errorMsg = errorMsg .. "\n\n鈿狅笍 Error interno del servidor API\n鈿狅笍 Intenta con otro video\n鈿狅笍 Verifica que el video sea p煤blico\n鈿狅笍 Espera unos minutos y reintenta"
+            elseif code == 429 then
+                errorMsg = errorMsg .. "\n\n鈿狅笍 L铆mite de solicitudes excedido\n鈿狅笍 Espera unos minutos antes de intentar nuevamente"
+            elseif code == 403 then
+                errorMsg = errorMsg .. "\n\n鈿狅笍 Video restringido o privado\n鈿狅笍 Intenta con un video p煤blico"
+            elseif code == 404 then
+                errorMsg = errorMsg .. "\n\n鈿狅笍 Video no encontrado\n鈿狅笍 Verifica que el enlace sea v谩lido"
+            elseif code == 0 then
+                errorMsg = errorMsg .. "\n\n鈿狅笍 Error de conexi贸n\n鈿狅笍 Verifica tu conexi贸n a internet\n鈿狅笍 Intenta nuevamente en unos minutos"
+            end
+            
+            showDialog("Error de Descarga", errorMsg)
+            return
+        end
+
+        -- Intentar parsear el contenido JSON de la respuesta de forma segura
+        local success, json, error = safeParseJSON(content)
+        if not success then
+            showDialog("Error", "Datos de descarga inv谩lidos: " .. (error or "Error desconocido"))
+            return
+        end
+
+        -- Verificar si la respuesta indica 茅xito
+        local apiSuccess = json.optBoolean("success", false)
+        if not apiSuccess then
+            local error_msg = json.optString("message", "Error desconocido al obtener enlaces de descarga")
+            showDialog("Error", error_msg)
+            return
+        end
+
+        local downloadOptions = {}
+        
+        -- La nueva API devuelve los medios directamente en el objeto principal
+        local medias = json.optJSONArray("medias")
+        
+        if not medias or medias.length() == 0 then
+            showDialog("Error", "No se encontraron medios de descarga en la respuesta de la API.")
+            return
+        end
+
+        -- Procesar todos los formatos disponibles en "medias"
+        for i = 0, medias.length() - 1 do
+            local media = medias.getJSONObject(i)
+            local formatId = media.optString("formatId", "")
+            local label = media.optString("label", "Desconocido")
+            local type = media.optString("type", "video") -- "video" o "audio"
+            local ext = media.optString("ext", "mp4")
+            local quality = media.optString("quality", label) -- usar label como fallback
+            local url = media.optString("url", "")
+            
+            -- Solo agregar si hay URL v谩lida
+            if url ~= "" then
+                local displayText = ""
+                
+                if type == "audio" then
+                    displayText = "馃幍 Audio " .. quality .. " (." .. ext .. ")"
+                else
+                    -- Para video, mostrar dimensiones si est谩n disponibles
+                    local width = media.optInt("width", 0)
+                    local height = media.optInt("height", 0)
+                    
+                    if width > 0 and height > 0 then
+                        displayText = "馃幀 Video " .. height .. "p (" .. width .. "x" .. height .. ") (." .. ext .. ")"
+                    else
+                        displayText = "馃幀 Video " .. quality .. " (." .. ext .. ")"
+                    end
+                end
+                
+                table.insert(downloadOptions, {
+                    quality = displayText,
+                    url = url,
+                    ext = ext,
+                    type = type,
+                    formatId = formatId
+                })
+            end
+        end
+
+        if #downloadOptions == 0 then
+            showDialog("Error", "No se encontraron enlaces de descarga v谩lidos para este video.")
+            return
+        end
+
+        -- Preparar los 铆tems para el di谩logo de selecci贸n de calidad
+        local items = {}
+        for _, option in ipairs(downloadOptions) do
+            table.insert(items, option.quality)
+        end
+
+        -- Mostrar di谩logo para seleccionar la calidad de descarga
+        local dlg = AlertDialog.Builder(context)
+        dlg.setTitle("Seleccionar calidad de descarga")
+        dlg.setItems(items, {
+            onClick = function(dialog, which)
+                local selected = downloadOptions[which + 1]
+                if selected then
+                    -- Obtener el servicio DownloadManager
+                    local downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE)
+
+                    -- Crear una nueva solicitud de descarga
+                    local request = DownloadManager.Request(Uri.parse(selected.url))
+
+                    -- Configurar el t铆tulo y la descripci贸n de la notificaci贸n de descarga
+                    request.setTitle("Descargando: " .. currentVideo.title)
+                    request.setDescription("Descargando " .. selected.type .. " en calidad " .. selected.quality)
+
+                    -- Establecer la visibilidad de la notificaci贸n
+                    request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+
+                    -- Establecer la ubicaci贸n de descarga en el directorio p煤blico de descargas
+                    -- Construir un nombre de archivo seguro
+                    local filename = currentVideo.title:gsub("[/\\:*?\"<>|]", "_") .. "." .. selected.ext
+                    request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
+
+                    -- A帽adir la solicitud a la cola del DownloadManager
+                    local downloadId = downloadManager.enqueue(request)
+
+                    showDialog("Descarga Iniciada", "El " .. selected.type .. " '" .. currentVideo.title .. "' se est谩 descargando. Puedes ver el progreso en las notificaciones.")
+                end
+            end
+        })
+        dlg.setNegativeButton("Cancelar", nil)
+        dlg.show()
+    end)
+end
+
+-- Crear el dise帽o de la interfaz de usuario (UI) con m谩rgenes corregidos
+local mainDialog = AlertDialog.Builder(context)
+mainDialog.setTitle("Buscador y Descargador de YouTube")
+
+local layout = {
+    LinearLayout,
+    orientation = "vertical",
+    padding = "16dp",
+    layout_width = "fill",
+    {
+        EditText,
+        id = "searchInput",
+        hint = "Buscar en YouTube...",
+        layout_width = "fill",
+        textSize = "16sp"
+    },
+    {
+        LinearLayout,
+        orientation = "horizontal",
+        layout_width = "fill",
+        {
+            Button,
+            text = "Buscar",
+            layout_width = "0dp",
+            layout_weight = "1",
+            backgroundColor = "#4CAF50", -- Un color verde bonito para el bot贸n
+            textColor = "#FFFFFF",     -- Texto blanco
+            onClick = function()
+                local query = searchInput.getText().toString()
+                if #query > 2 then -- Recomendar un m铆nimo de 3 caracteres para la b煤squeda
+                    searchVideos(query)
+                else
+                    showDialog("Advertencia", "Ingrese al menos 3 caracteres para buscar.")
+                end
+            end
+        },
+        {
+            Space, -- Usar Space en lugar de marginLeft
+            layout_width = "8dp",
+            layout_height = "1dp"
+        },
+        {
+            Button,
+            text = "Cr茅ditos",
+            layout_width = "0dp",
+            layout_weight = "0.6",
+            backgroundColor = "#2196F3", -- Azul para el bot贸n de cr茅ditos
+            textColor = "#FFFFFF",
+            onClick = function()
+                showCredits()
+            end
+        }
+    },
+    {
+        TextView,
+        id = "statusText",
+        text = "Ingrese t茅rminos de b煤squeda",
+        gravity = "center",
+        layout_width = "fill",
+        paddingTop = "16dp",
+        textSize = "14sp"
+    },
+    {
+        ListView,
+        id = "resultsList",
+        layout_width = "fill",
+        layout_height = "300dp", -- Altura fija para la lista de resultados
+        dividerHeight = "1dp",    -- Separador entre elementos de la lista
+        background = "#FFFFFF"    -- Fondo blanco para la lista
+    }
+}
+
+mainDialog.setView(loadlayout(layout)) -- Cargar el dise帽o en el di谩logo
+mainDialog.setNegativeButton("Cerrar", nil) -- Bot贸n para cerrar el di谩logo principal
+local dialog = mainDialog.show() -- Mostrar el di谩logo principal
+
+-- Configurar el evento de clic en los 铆tems de la ListView
+resultsList.setOnItemClickListener(AdapterView.OnItemClickListener{
+    onItemClick = function(parent, view, position, id)
+        currentVideo = searchResults[position + 1] -- Obtener el video seleccionado
+
+        -- Mostrar un di谩logo con opciones para el video seleccionado
+        downloadDialog = AlertDialog.Builder(context)
+        .setTitle("Opciones de Video")
+        .setMessage(currentVideo.title) -- Mostrar el t铆tulo del video
+        .setPositiveButton("Descargar", {
+            onClick = function()
+                startDownload() -- Llamar a la funci贸n para obtener enlaces y descargar
+            end
+        })
+        .setNegativeButton("Cancelar", nil) -- Bot贸n para cancelar
+        .setNeutralButton("Ver en YouTube", {
+            onClick = function()
+                -- Abrir el video en la aplicaci贸n de YouTube o navegador
+                local intent = Intent(Intent.ACTION_VIEW)
+                intent.setData(Uri.parse(currentVideo.url))
+                context.startActivity(intent)
+            end
+        })
+        .show()
+    end
+})
